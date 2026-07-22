@@ -1,0 +1,341 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 15,
+   "id": "6b9d0998-b9e5-4fbf-a86e-e3a849556e50",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Matplotlib is building the font cache; this may take a moment.\n"
+     ]
+    }
+   ],
+   "source": [
+    "\"\"\"\n",
+    "DENT / OIL-CANNIONG SURROGATE - V1 PROOF-OUT\n",
+    "--------------------------------------------\n",
+    "--------------------------------------------\n",
+    "GOAL: predict, from ROUGH EARLy geometry, whether hood panel will\n",
+    "    (a) DENT -> how much force it takes to leave a permanent mark (a number\n",
+    "    (b) OIL-CAN -> does it pop in/out under load, yes/no          (b label\n",
+    "\n",
+    "    so the designer gets the answer at thier desk, instead of waiting weeks for the final class A-surface + full FEA solve\n",
+    "    Important - WHAT THIS DATA is: A  surrogate is always trained on simulation output. I dont have FORD's sim courpus yet, so we GENERATE\n",
+    "    a physically-plausible dataset from known panel-mechanics relatioships + realistic noise. This proves the technique.\n",
+    "    These numbers are NOT real Ford results. Proof-out proves the method; Ford deployment is gates on the real sim data.\n",
+    " \"\"\"   \n",
+    "import os\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib\n",
+    "matplotlib.use(\"Agg\")       # save plots to file, no display needed\n",
+    "import matplotlib\n",
+    "matplotlib.use(\"Agg\")\n",
+    "import matplotlib.pyplot as plt   \n",
+    "\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier\n",
+    "from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,\n",
+    "                             accuracy_score, precision_score, recall_score,\n",
+    "                             roc_auc_score, confusion_matrix)\n",
+    "from sklearn.inspection import permutation_importance\n",
+    "\n",
+    "np.random.seed(42)     # reproducible: re-run -> same numbers\n",
+    "\n",
+    "OUT = \"C:/Users/HNAWAZ1/Documents/outputs\"\n",
+    "os.makedirs(OUT, exist_ok=True)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 16,
+   "id": "03e98c7b-1545-4cfd-9e2a-e826d082658b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# STEP 1 - MAKE THE DATASET (each panel = few numbers a designer knows early)\n",
+    "N = 1200\n",
+    "thickness_mm      = np.random.uniform(0.65, 1.15, N)      # sheet thickness\n",
+    "panel_span_mm     = np.random.uniform(350, 850, N)        # largest UNSUPPORTED distance\n",
+    "curvature_1_per_m = np.random.uniform(0.10, 1.40, N)      # how curved (flat=low, dome=high)\n",
+    "yield_strength    = np.random.choice([180, 210, 240, 280, 340], N) + np.random.uniform(-10, 10, N)\n",
+    "youngs_modulus    = np.random.uniform(196, 206, N)        # steel stiffness (varies slightly)\n",
+    "\n",
+    "# ---- physics we are baking in (directions are real engineering, magnitudes are illustrative) ----\n",
+    "# DENT force: up with thickness^2 and yield and curvature, down with span\n",
+    "dent_force_N = (1.0 * yield_strength * thickness_mm**2\n",
+    "                * (1 + 0.8 * curvature_1_per_m)\n",
+    "                * (youngs_modulus / 200.0)**0.3\n",
+    "                / (panel_span_mm / 500.0)**1.2)\n",
+    "dent_force_N *= np.random.normal(1.0, 0.08, N)            # +-8% \"sim scatter\" noise\n",
+    "\n",
+    "# Oil-can margin: high = safe. Flat + thin + large => oil-cans. Curvature matters.\n",
+    "oilcan_margin = (0.2 * youngs_modulus * thickness_mm**2\n",
+    "                 * (1 + 3.0 * curvature_1_per_m)\n",
+    "                 / (panel_span_mm / 500.0)**2)\n",
+    "oilcan_margin_noisy = oilcan_margin + np.random.normal(0, 0.15 * oilcan_margin.std(), N)\n",
+    "oilcan = (oilcan_margin_noisy < np.median(oilcan_margin)).astype(int)   # 1 = it oil-cans\n",
+    "\n",
+    "df = pd.DataFrame({\n",
+    "    \"thickness_mm\": thickness_mm,\n",
+    "    \"panel_span_mm\": panel_span_mm,\n",
+    "    \"curvature_1_per_m\": curvature_1_per_m,\n",
+    "    \"yield_strength_mpa\": yield_strength,\n",
+    "    \"youngs_modulus_gpa\": youngs_modulus,\n",
+    "    \"dent_force_N\": dent_force_N,\n",
+    "    \"oilcans\": oilcan,\n",
+    "})\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 17,
+   "id": "653db6f7-b86a-4760-9d50-6d400ac070bd",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "[CLEAN] removed 17 bad rows (unit slips + missing); 1183 rows remain\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Step 2 - DATA CLEANING (inject a few real-world messes, then fix them)\n",
+    "# Simulate two classic problems: unit slips (microns typed as mm) and missing values\n",
+    "\n",
+    "dirty = df.copy()\n",
+    "dirty.loc[dirty.sample(10, random_state=1).index, \"thickness_mm\"] *= 100   # unit slip (mm -> microns)\n",
+    "dirty.loc[dirty.sample(8, random_state=2).index, \"panel_span_mm\"] = np.nan  # missing values\n",
+    "\n",
+    "before = len(dirty)\n",
+    "dirty = dirty[(dirty[\"thickness_mm\"] > 0.3) & (dirty[\"thickness_mm\"] < 3.0)]  # kill unit slips\n",
+    "dirty = dirty.dropna()                                                        # kill missing rows\n",
+    "df = dirty.reset_index(drop=True)\n",
+    "print(f\"[CLEAN] removed {before - len(df)} bad rows (unit slips + missing); {len(df)} rows remain\")\n",
+    "\n",
+    "FEATURES = [\"thickness_mm\", \"panel_span_mm\", \"curvature_1_per_m\",\n",
+    "            \"yield_strength_mpa\", \"youngs_modulus_gpa\"]\n",
+    "X = df[FEATURES]\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 18,
+   "id": "8769bf39-913b-4182-bc34-6085ca085dbf",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "DENT RESISTANCE (regression)\n",
+      "  MAE  =   23.9 N       (baseline 'guess average' MAE =  125.8 N)\n",
+      "  RMSE =   34.6 N\n",
+      "  R2   =  0.954          (1.0 = perfect, 0 = no better than the average)\n",
+      "\n",
+      "OIL-CANNING (classification: 1 = oil-cans)\n",
+      "  Accuracy  = 0.916  (baseline 'always guess majority' = 0.540)\n",
+      "  Precision = 0.929  Recall = 0.914  ROC-AUC = 0.979\n",
+      "  Confusion matrix [rows=true, cols=pred]:\n",
+      "  [[100, 9], [11, 117]]\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "# STEP 3 - Split into TRAIN/TEST (test data the model NEVER sees while learning)\n",
+    "# NOTE on LEAKAGE: here every row is an independent panel, so a random split is fine.\n",
+    "# In a real program you would split by geometry FAMILY, so near-identical panels don't\n",
+    "# end up in both train and test.\n",
+    "Xtr, Xte, ytr_d, yte_d, ytr_o, yte_o = train_test_split(\n",
+    "    X, df[\"dent_force_N\"], df[\"oilcans\"], test_size=0.20, random_state=42)\n",
+    "\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "# STEP 4 - TRAIN THE MODEL\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "dent_model = HistGradientBoostingRegressor(random_state=42).fit(Xtr, ytr_d)\n",
+    "oil_model  = HistGradientBoostingClassifier(random_state=42).fit(Xtr, ytr_o)\n",
+    "\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "# STEP 5 - VALIDATE (how good is it? and always compare to a dumb baseline)\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "pred_d = dent_model.predict(Xte)\n",
+    "mae    = mean_absolute_error(yte_d, pred_d)\n",
+    "rmse   = mean_squared_error(yte_d, pred_d) ** 0.5\n",
+    "r2     = r2_score(yte_d, pred_d)\n",
+    "baseline_mae = mean_absolute_error(yte_d, np.full_like(yte_d, ytr_d.mean()))\n",
+    "\n",
+    "print(\"DENT RESISTANCE (regression)\")\n",
+    "print(f\"  MAE  = {mae:6.1f} N       (baseline 'guess average' MAE = {baseline_mae:6.1f} N)\")\n",
+    "print(f\"  RMSE = {rmse:6.1f} N\")\n",
+    "print(f\"  R2   = {r2:6.3f}          (1.0 = perfect, 0 = no better than the average)\\n\")\n",
+    "\n",
+    "pred_o  = oil_model.predict(Xte)\n",
+    "proba_o = oil_model.predict_proba(Xte)[:, 1]\n",
+    "acc     = accuracy_score(yte_o, pred_o)\n",
+    "prec    = precision_score(yte_o, pred_o)\n",
+    "rec     = recall_score(yte_o, pred_o)\n",
+    "auc     = roc_auc_score(yte_o, proba_o)\n",
+    "base_acc = max(yte_o.mean(), 1 - yte_o.mean())\n",
+    "cm = confusion_matrix(yte_o, pred_o)\n",
+    "\n",
+    "print(\"OIL-CANNING (classification: 1 = oil-cans)\")\n",
+    "print(f\"  Accuracy  = {acc:5.3f}  (baseline 'always guess majority' = {base_acc:5.3f})\")\n",
+    "print(f\"  Precision = {prec:5.3f}  Recall = {rec:5.3f}  ROC-AUC = {auc:5.3f}\")\n",
+    "print(f\"  Confusion matrix [rows=true, cols=pred]:\\n  {cm.tolist()}\\n\")\n",
+    "\n",
+    "                                                                      \n",
+    "\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 19,
+   "id": "1d758ac8-77b6-4bde-a437-e4401fcdd419",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "OUT-OF-DISTRIBUTION CHECK (dent model trained only on thickness 0.75-1.00 mm)\n",
+      "  error INSIDE training range  =   28.0 N\n",
+      "  error OUTSIDE training range =   61.7 N  <- trust collapses outside the training range\n",
+      "\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ----------------------------------------------------------------------------------\n",
+    "# STEP 6 - WHERE DOES IT BREAK? (THE SURROGATE'S HONEST LIMIT, MADE VISIBLE)\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "# Retrain dent model on a NARROW thickness band, then test INSIDE vs OUTSIDE that band.\n",
+    "band = (Xtr[\"thickness_mm\"] >= 0.75) & (Xtr[\"thickness_mm\"] <= 1.00)\n",
+    "m_band = HistGradientBoostingRegressor(random_state=42).fit(Xtr[band], ytr_d[band])\n",
+    "\n",
+    "in_mask  = (Xte[\"thickness_mm\"] >= 0.75) & (Xte[\"thickness_mm\"] <= 1.00)\n",
+    "out_mask = ~in_mask\n",
+    "\n",
+    "mae_in  = mean_absolute_error(yte_d[in_mask],  m_band.predict(Xte[in_mask]))\n",
+    "mae_out = mean_absolute_error(yte_d[out_mask], m_band.predict(Xte[out_mask]))\n",
+    "\n",
+    "print(\"OUT-OF-DISTRIBUTION CHECK (dent model trained only on thickness 0.75-1.00 mm)\")\n",
+    "print(f\"  error INSIDE training range  = {mae_in:6.1f} N\")\n",
+    "print(f\"  error OUTSIDE training range = {mae_out:6.1f} N  <- trust collapses outside the training range\\n\")\n",
+    "\n",
+    "\n",
+    "                 "
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 20,
+   "id": "5f45f648-7c3f-4ce8-8d02-47997cd3e052",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "DENT - feature importance (does the model agree with physics?)\n",
+      "  thickness_mm            0.688\n",
+      "  panel_span_mm           0.684\n",
+      "  yield_strength_mpa      0.324\n",
+      "  curvature_1_per_m       0.237\n",
+      "  youngs_modulus_gpa     -0.001\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ----------------------------------------------------------------------------------\n",
+    "# STEP 7 - WHICH FEATURES DRIVE IT? (explainability + physics sanity check)\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "imp = permutation_importance(dent_model, Xte, yte_d, n_repeats=10, random_state=42)\n",
+    "order = imp.importances_mean.argsort()[::-1]\n",
+    "print(\"DENT - feature importance (does the model agree with physics?)\")\n",
+    "for i in order:\n",
+    "    print(f\"  {FEATURES[i]:20s} {imp.importances_mean[i]:8.3f}\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 21,
+   "id": "aefe75ac-3aa9-4027-8d8b-ae5666ce6f7a",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "\n",
+      "[DONE] saved dataset + 3 plots to C:/Users/HNAWAZ1/Documents/outputs\n"
+     ]
+    }
+   ],
+   "source": [
+    "# ----------------------------------------------------------------------------------\n",
+    "# STEP 8 - PLOTS (the pictures you show people)\n",
+    "# ----------------------------------------------------------------------------------\n",
+    "# (a) predicted vs actual - the classic \"does it work\" plot\n",
+    "plt.figure(figsize=(5, 5))\n",
+    "plt.scatter(yte_d, pred_d, s=10, alpha=0.5)\n",
+    "lims = [min(yte_d.min(), pred_d.min()), max(yte_d.max(), pred_d.max())]\n",
+    "plt.plot(lims, lims, \"r--\", lw=1, label=\"perfect prediction\")\n",
+    "plt.xlabel(\"actual dent force (N)\"); plt.ylabel(\"predicted dent force (N)\")\n",
+    "plt.title(f\"Dent surrogate: predicted vs actual  (R2={r2:.2f})\"); plt.legend()\n",
+    "plt.tight_layout(); plt.savefig(f\"{OUT}/plot_predicted_vs_actual.png\", dpi=130); plt.close()\n",
+    "\n",
+    "# (b) feature importance bar\n",
+    "plt.figure(figsize=(6, 3.5))\n",
+    "plt.barh([FEATURES[i] for i in order][::-1], imp.importances_mean[order][::-1])\n",
+    "plt.xlabel(\"importance\"); plt.title(\"What drives dent resistance (learned)\")\n",
+    "plt.tight_layout(); plt.savefig(f\"{OUT}/plot_feature_importance.png\", dpi=130); plt.close()\n",
+    "\n",
+    "# (c) the honest-limit bar: in vs out of distribution\n",
+    "plt.figure(figsize=(4.5, 3.5))\n",
+    "plt.bar([\"inside\\ntraining range\", \"outside\\ntraining range\"], [mae_in, mae_out],\n",
+    "        color=[\"#2a9d8f\", \"#e76f51\"])\n",
+    "plt.ylabel(\"prediction error (N)\"); plt.title(\"Surrogate is only trustworthy in-distribution\")\n",
+    "plt.tight_layout(); plt.savefig(f\"{OUT}/plot_out_of_distribution.png\", dpi=130); plt.close()\n",
+    "\n",
+    "df.to_csv(f\"{OUT}/hood_panel_dataset.csv\", index=False)\n",
+    "print(f\"\\n[DONE] saved dataset + 3 plots to {OUT}\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "59248b67-14a0-4d34-82ad-d9a7033fda24",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.13.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
