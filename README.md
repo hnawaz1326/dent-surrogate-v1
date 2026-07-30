@@ -14,6 +14,9 @@ Dent resistance (regression): predicted force (N) to cause a permanent dent.
 Oil‑canning (classification): binary label 1 = oil‑cans (pop in/out) so designers can avoid unstable panels.
 Technical details (concise)
 
+<img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/ce63f3f5-163c-4936-ab7b-369e0a639938" />
+
+
 Dataset: synthetic, physics-inspired generator (N=1200 samples; cleaned → 1183 rows).
 Input features: thickness_mm, panel_span_mm, curvature_1_per_m, yield_strength_mpa, youngs_modulus_gpa.
 Synthetic formulas: explicit physics-like relationships for dent_force_N and oilcan_margin with added Gaussian noise to simulate scatter.
