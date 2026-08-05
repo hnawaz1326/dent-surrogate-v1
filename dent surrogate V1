@@ -1,21 +1,4 @@
-{
- "cells": [
-  {
-   "cell_type": "code",
-   "execution_count": 15,
-   "id": "6b9d0998-b9e5-4fbf-a86e-e3a849556e50",
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stderr",
-     "output_type": "stream",
-     "text": [
-      "Matplotlib is building the font cache; this may take a moment.\n"
-     ]
-    }
-   ],
-   "source": [
-    "\"\"\"\n",
+
     "DENT / OIL-CANNIONG SURROGATE - V1 PROOF-OUT\n",
     "--------------------------------------------\n",
     "--------------------------------------------\n",
